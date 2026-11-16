@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>新建拆样运行</h2>
+<form method="post" action="/runs" enctype="multipart/form-data">
+  <div>运行号:<input type="text" name="run_number" required
+       pattern="[A-Za-z0-9][A-Za-z0-9_.\-]*" maxlength="64"
+       title="字母或数字开头,可含 - _ ."></div>
+  <div>R1 FASTQ(未压缩):<input type="file" name="r1" required></div>
+  <div>R2 FASTQ(未压缩):<input type="file" name="r2" required></div>
+  <div>I1 FASTQ(未压缩):<input type="file" name="i1" required></div>
+  <div>样本索引 CSV(样本号,索引序列):<input type="file" name="samples" accept=".csv" required></div>
+  <div><button type="submit">开始拆样</button></div>
+</form>
+
+<h2>运行记录</h2>
+{% if runs %}
+<table>
+  <tr><th>运行号</th><th>状态</th><th>总对数</th><th>提交时间(UTC)</th><th>说明</th><th></th></tr>
+  {% for r in runs %}
+  <tr>
+    <td>{{ r.run_number }}</td>
+    <td><span class="badge b-{{ r.status }}">{{ labels[r.status] }}</span></td>
+    <td>{{ r.total_pairs }}</td>
+    <td>{{ r.created_at }}</td>
+    <td class="err">{{ r.error or "" }}</td>
+    <td><a href="/runs/{{ r.id }}">查看</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p>暂无运行。</p>
+{% endif %}
+{% endblock %}

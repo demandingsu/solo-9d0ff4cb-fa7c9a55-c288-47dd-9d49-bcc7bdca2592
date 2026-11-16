@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}泳道拆样台{% endblock %}</title>
+{% block head %}{% endblock %}
+<style>
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         max-width: 980px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  table { border-collapse: collapse; width: 100%; margin: .6rem 0; }
+  th, td { border: 1px solid #ccc; padding: .4rem .6rem; text-align: left; }
+  th { background: #f2f2f2; }
+  .badge { padding: .1rem .55rem; border-radius: .4rem; font-size: .85rem; }
+  .b-processing { background: #fff3cd; }
+  .b-published { background: #d4edda; }
+  .b-failed { background: #f8d7da; }
+  form div { margin: .45rem 0; }
+  .err { color: #a00; }
+  a { color: #0b5ed7; }
+</style>
+</head>
+<body>
+<h1><a href="/" style="text-decoration:none;color:inherit">泳道拆样台</a></h1>
+{% block content %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block head %}
+{% if run.status == "processing" %}<meta http-equiv="refresh" content="3">{% endif %}
+{% endblock %}
+{% block content %}
+<h2>运行 {{ run.run_number }}</h2>
+<p>状态:<span class="badge b-{{ run.status }}">{{ labels[run.status] }}</span><br>
+提交时间(UTC):{{ run.created_at }}
+{% if run.published_at %}<br>发布时间(UTC):{{ run.published_at }}{% endif %}</p>
+
+{% if run.status == "failed" %}
+<p class="err">失败原因:{{ run.error }}</p>
+<p>本次未发布任何文件;修正输入后可用同一运行号重新提交。</p>
+{% elif run.status == "processing" %}
+<p>正在逐对拆分,页面每 3 秒自动刷新……</p>
+{% endif %}
+
+{% if run.status == "published" %}
+<p>总读段对:{{ run.total_pairs }}</p>
+<table>
+  <tr><th>分组</th><th>索引序列</th><th>对数</th><th>其中纠错</th><th>R1 下载</th><th>R2 下载</th></tr>
+  {% for g in groups %}
+  <tr>
+    <td>{{ g.sample_id }}</td>
+    <td>{{ g.index_seq or "—" }}</td>
+    <td>{{ g.pairs }}</td>
+    <td>{{ g.corrected }}</td>
+    <td><a href="/runs/{{ run.id }}/download/{{ g.r1 }}">{{ g.r1 }}</a></td>
+    <td><a href="/runs/{{ run.id }}/download/{{ g.r2 }}">{{ g.r2 }}</a></td>
+  </tr>
+  {% endfor %}
+</table>
+<p>处理日志:<a href="/runs/{{ run.id }}/download/demux.log">demux.log</a></p>
+{% endif %}
+{% endblock %}

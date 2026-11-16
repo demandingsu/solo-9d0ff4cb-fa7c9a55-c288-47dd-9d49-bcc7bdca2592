@@ -1,0 +1,13 @@
+services:
+  demux:
+    build: .
+    image: fastq-demux
+    container_name: fastq-demux
+    ports:
+      - "8000:8000"
+    volumes:
+      - demux_data:/app/data   # SQLite + 暂存区 + 发布区,同一数据卷保证原子改名
+    restart: unless-stopped
+
+volumes:
+  demux_data:
