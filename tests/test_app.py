@@ -283,3 +283,296 @@ def test_index_page(client):
     resp = client.get("/")
     assert resp.status_code == 200
     assert "新建拆样运行" in resp.text
+
+
+# ------------------------------------------------------------ 发布后完整性
+
+def published_dir_of(client, run_number):
+    return client.data_dir / "published" / run_number
+
+
+def drop_evidence(run_id):
+    """模拟旧库:已发布但发布时没有内容摘要依据。"""
+    from app.config import db_path
+    from app.db import db_conn
+    with db_conn(db_path()) as conn:
+        conn.execute("DELETE FROM published_files WHERE run_id=?", (run_id,))
+        conn.execute(
+            "UPDATE runs SET integrity_mode=NULL, verified_at=NULL WHERE id=?",
+            (run_id,),
+        )
+
+
+def restart(client):
+    """在同一个 DATA_DIR 上模拟进程重启。"""
+    from app.main import recover_interrupted
+    recover_interrupted()
+
+
+def corrupt_sequence_base(path, replacement=b"T"):
+    """改写某文件第 1 条记录的序列首碱基,长度保持不变。
+
+    只动序列行,不碰记录头,因此 R1/R2 配对与 FASTQ 结构仍然合法。
+    """
+    lines = path.read_bytes().splitlines(keepends=True)
+    seq = lines[1].rstrip(b"\r\n")
+    lines[1] = replacement * len(seq) + lines[1][len(seq):]
+    path.write_bytes(b"".join(lines))
+
+
+def test_publish_records_content_evidence(client):
+    rid = run_id_of(submit_good(client, "EV1"))
+    st = wait_done(client, rid)
+    assert st["status"] == "published"
+    assert st["integrity_mode"] == "digest"
+    from app.config import db_path
+    from app.db import db_conn
+    with db_conn(db_path()) as conn:
+        rows = conn.execute(
+            "SELECT filename, size_bytes, sha256, records FROM published_files "
+            "WHERE run_id=? ORDER BY filename", (rid,)
+        ).fetchall()
+    names = [r["filename"] for r in rows]
+    assert "S1_R1.fastq" in names and "S1_R2.fastq" in names
+    assert "undetermined_R1.fastq" in names and "demux.log" in names
+    assert all(r["sha256"] and r["size_bytes"] > 0 for r in rows)
+    by_name = {r["filename"]: r for r in rows}
+    assert by_name["S1_R1.fastq"]["records"] == 3
+    assert by_name["S2_R1.fastq"]["records"] == 1
+
+    page = client.get(f"/runs/{rid}")
+    assert "SHA-256" in page.text
+
+
+def test_restart_detects_truncated_published_file(client):
+    rid = run_id_of(submit_good(client, "TRUNC"))
+    assert wait_done(client, rid)["status"] == "published"
+    target = published_dir_of(client, "TRUNC") / "S1_R2.fastq"
+    data = target.read_bytes()
+    target.write_bytes(data[:-5])  # 截断但目录、其余文件仍在
+
+    restart(client)
+
+    st = client.get(f"/api/runs/{rid}").json()
+    assert st["status"] == "failed"
+    assert "截断" in st["error"]
+    assert st["total_pairs"] is None and st["counts"] == []
+    assert not published_dir_of(client, "TRUNC").exists()  # 已移出供数区
+
+    page = client.get(f"/runs/{rid}")
+    assert page.status_code == 200 and "完整性核验失败" in page.text
+    assert "S1_R1.fastq" not in page.text  # 不再展示下载与可信计数
+    assert client.get(f"/runs/{rid}/download/S1_R1.fastq").status_code == 409
+
+
+def test_restart_detects_missing_published_file(client):
+    rid = run_id_of(submit_good(client, "MISS"))
+    assert wait_done(client, rid)["status"] == "published"
+    (published_dir_of(client, "MISS") / "S2_R1.fastq").unlink()
+
+    restart(client)
+    st = client.get(f"/api/runs/{rid}").json()
+    assert st["status"] == "failed" and "缺失" in st["error"]
+
+
+def test_restart_detects_missing_log(client):
+    rid = run_id_of(submit_good(client, "NOLOG"))
+    assert wait_done(client, rid)["status"] == "published"
+    (published_dir_of(client, "NOLOG") / "demux.log").unlink()
+
+    restart(client)
+    st = client.get(f"/api/runs/{rid}").json()
+    assert st["status"] == "failed" and "demux.log" in st["error"]
+
+
+def test_restart_detects_equal_length_corruption(client):
+    rid = run_id_of(submit_good(client, "SAME"))
+    assert wait_done(client, rid)["status"] == "published"
+    target = published_dir_of(client, "SAME") / "S1_R1.fastq"
+    before = target.read_bytes()
+    corrupt_sequence_base(target)  # 同长度改写,结构调整无法发现
+    assert len(target.read_bytes()) == len(before)
+
+    restart(client)
+    st = client.get(f"/api/runs/{rid}").json()
+    assert st["status"] == "failed"
+    assert "SHA-256" in st["error"]
+    assert client.get(f"/runs/{rid}/download/S1_R1.fastq").status_code == 409
+
+
+def test_download_rechecks_and_stops_whole_run(client):
+    rid = run_id_of(submit_good(client, "DL"))
+    assert wait_done(client, rid)["status"] == "published"
+    # 另一组文件保持完好,但核验发现一组损坏就停止整次运行供数
+    target = published_dir_of(client, "DL") / "undetermined_R2.fastq"
+    target.write_bytes(target.read_bytes()[:-3])
+
+    resp = client.get(f"/runs/{rid}/download/S1_R1.fastq")
+    assert resp.status_code == 409
+    assert "完整性核验失败" in resp.json()["detail"]
+    assert client.get(f"/runs/{rid}/download/demux.log").status_code == 409
+    assert client.get(f"/api/runs/{rid}").json()["status"] == "failed"
+
+
+def test_damaged_run_can_be_reuploaded(client):
+    rid = run_id_of(submit_good(client, "RETRY"))
+    assert wait_done(client, rid)["status"] == "published"
+    target = published_dir_of(client, "RETRY") / "S1_R1.fastq"
+    target.write_bytes(target.read_bytes()[:20])
+    assert client.get(f"/runs/{rid}/download/S1_R1.fastq").status_code == 409
+
+    rid2 = run_id_of(submit_good(client, "RETRY"))
+    st2 = wait_done(client, rid2)
+    assert st2["status"] == "published" and st2["integrity_mode"] == "digest"
+    assert st2["total_pairs"] == 7
+    assert client.get(f"/runs/{rid2}/download/S1_R1.fastq").status_code == 200
+
+
+def test_integrity_failure_isolated_to_one_run(client):
+    good_rid = run_id_of(submit_good(client, "GOOD"))
+    bad_rid = run_id_of(submit_good(client, "BAD"))
+    assert wait_done(client, good_rid)["status"] == "published"
+    assert wait_done(client, bad_rid)["status"] == "published"
+    (published_dir_of(client, "BAD") / "S3_R1.fastq").write_bytes(b"@short\n")
+
+    restart(client)
+
+    assert client.get(f"/api/runs/{bad_rid}").json()["status"] == "failed"
+    good = client.get(f"/api/runs/{good_rid}").json()
+    assert good["status"] == "published" and good["total_pairs"] == 7
+    assert client.get(f"/runs/{good_rid}/download/S1_R1.fastq").status_code == 200
+
+
+def test_legacy_run_uses_structural_check_only(client):
+    rid = run_id_of(submit_good(client, "LEGACY"))
+    assert wait_done(client, rid)["status"] == "published"
+    drop_evidence(rid)
+
+    restart(client)
+    st = client.get(f"/api/runs/{rid}").json()
+    assert st["status"] == "published" and st["integrity_mode"] == "structure"
+    page = client.get(f"/runs/{rid}")
+    assert "无法追溯" in page.text and "等长内容改动" in page.text
+    assert client.get(f"/runs/{rid}/download/S1_R1.fastq").status_code == 200
+
+    # 等长改写:旧库没有摘要,不能假装能发现它
+    target = published_dir_of(client, "LEGACY") / "S1_R1.fastq"
+    before = target.read_bytes()
+    corrupt_sequence_base(target)
+    assert len(target.read_bytes()) == len(before)
+    restart(client)
+    st = client.get(f"/api/runs/{rid}").json()
+    assert st["status"] == "published"  # 诚实的限制:结构仍合法
+    assert st["integrity_mode"] == "structure"
+
+    # 但结构损坏、截断、配对不符、与入库对数不符都必须被发现
+    target.write_bytes(target.read_bytes()[:-10])
+    restart(client)
+    st = client.get(f"/api/runs/{rid}").json()
+    assert st["status"] == "failed"
+
+
+def test_legacy_run_detects_pair_and_count_mismatch(client):
+    rid = run_id_of(submit_good(client, "LEGACY2"))
+    assert wait_done(client, rid)["status"] == "published"
+    drop_evidence(rid)
+
+    # 同长度篡改读段号,破坏 R1/R2 配对
+    target = published_dir_of(client, "LEGACY2") / "S1_R2.fastq"
+    data = target.read_bytes()
+    target.write_bytes(data.replace(b"1000:2000", b"9999:9999", 1))
+    restart(client)
+    st = client.get(f"/api/runs/{rid}").json()
+    assert st["status"] == "failed" and "读段号不一致" in st["error"]
+
+    # 重新发布后再同时删掉一条完整记录(结束在记录边界):
+    # R1/R2 仍成对,但与入库对数不符
+    rid2 = run_id_of(submit_good(client, "LEGACY2"))
+    assert wait_done(client, rid2)["status"] == "published"
+    drop_evidence(rid2)
+    for suffix in ("R1", "R2"):
+        target = published_dir_of(client, "LEGACY2") / f"S1_{suffix}.fastq"
+        lines = target.read_bytes().splitlines(keepends=True)
+        target.write_bytes(b"".join(lines[:-4]))
+    restart(client)
+    st = client.get(f"/api/runs/{rid2}").json()
+    assert st["status"] == "failed" and "入库对数" in st["error"]
+
+
+def test_hash_file_streams_without_full_read(tmp_path, monkeypatch):
+    import hashlib
+    from app import integrity
+
+    payload = os.urandom(200_000)
+    p = tmp_path / "big.fastq"
+    p.write_bytes(payload)
+    monkeypatch.setattr(integrity, "CHUNK_SIZE", 4096)  # 强制多次小块读取
+    size, digest = integrity.hash_file(p)
+    assert size == len(payload)
+    assert digest == hashlib.sha256(payload).hexdigest()
+
+
+def test_digest_run_without_evidence_is_not_downgraded(client):
+    """已声明有内容摘要的运行,摘要记录丢失时不能悄悄降级成结构核验。"""
+    rid = run_id_of(submit_good(client, "NOEV"))
+    assert wait_done(client, rid)["status"] == "published"
+    from app.config import db_path
+    from app.db import db_conn
+    with db_conn(db_path()) as conn:
+        conn.execute("DELETE FROM published_files WHERE run_id=?", (rid,))
+
+    restart(client)
+    st = client.get(f"/api/runs/{rid}").json()
+    assert st["status"] == "failed"
+    assert "不能降级" in st["error"]
+
+
+def test_init_db_migrates_legacy_schema(tmp_path):
+    import sqlite3
+    from app.db import init_db
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE runs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_number TEXT NOT NULL UNIQUE,
+          status TEXT NOT NULL,
+          error TEXT,
+          staging_dir TEXT NOT NULL,
+          r1_name TEXT NOT NULL DEFAULT '',
+          r2_name TEXT NOT NULL DEFAULT '',
+          i1_name TEXT NOT NULL DEFAULT '',
+          samples_name TEXT NOT NULL DEFAULT '',
+          total_pairs INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          published_at TEXT
+        );
+        CREATE TABLE sample_counts (
+          run_id INTEGER NOT NULL,
+          sample_id TEXT NOT NULL,
+          index_seq TEXT NOT NULL DEFAULT '',
+          pairs INTEGER NOT NULL,
+          corrected INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (run_id, sample_id)
+        );
+        INSERT INTO runs(run_number, status, staging_dir, created_at, updated_at)
+        VALUES ('OLD', 'published', '/x', 't', 't');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    init_db(path)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)")}
+    assert {"integrity_mode", "verified_at"} <= cols
+    tables = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "published_files" in tables
+    row = conn.execute("SELECT * FROM runs WHERE run_number='OLD'").fetchone()
+    assert row["integrity_mode"] is None  # 旧运行不会被冒充为有摘要
+    conn.close()

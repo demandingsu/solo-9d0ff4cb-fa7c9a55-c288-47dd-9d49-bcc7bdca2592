@@ -15,8 +15,13 @@ def staging_dir() -> Path:
 
 
 def published_dir() -> Path:
-    """发布区:只有完整处理成功的运行才会出现在这里。"""
+    """发布区:只有完整处理成功且通过完整性登记的运行才会出现在这里。"""
     return data_dir() / "published"
+
+
+def quarantine_dir() -> Path:
+    """核验失败的发布目录移到这里留档,不再对外供数。"""
+    return data_dir() / "quarantine"
 
 
 def db_path() -> Path:

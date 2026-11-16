@@ -20,7 +20,7 @@
   <tr>
     <td>{{ r.run_number }}</td>
     <td><span class="badge b-{{ r.status }}">{{ labels[r.status] }}</span></td>
-    <td>{{ r.total_pairs }}</td>
+    <td>{{ r.total_pairs if r.status == "published" else "—" }}</td>
     <td>{{ r.created_at }}</td>
     <td class="err">{{ r.error or "" }}</td>
     <td><a href="/runs/{{ r.id }}">查看</a></td>

@@ -16,7 +16,9 @@ CREATE TABLE IF NOT EXISTS runs (
   total_pairs   INTEGER NOT NULL DEFAULT 0,
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL,
-  published_at  TEXT
+  published_at  TEXT,
+  integrity_mode TEXT,                     -- digest=有内容摘要;structure=旧库仅结构核验
+  verified_at    TEXT
 );
 CREATE TABLE IF NOT EXISTS sample_counts (
   run_id     INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -26,7 +28,21 @@ CREATE TABLE IF NOT EXISTS sample_counts (
   corrected  INTEGER NOT NULL DEFAULT 0,   -- 其中经单碱基纠错的对数
   PRIMARY KEY (run_id, sample_id)
 );
+CREATE TABLE IF NOT EXISTS published_files (
+  run_id     INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  filename   TEXT NOT NULL,                -- 如 S1_R1.fastq
+  size_bytes INTEGER NOT NULL,             -- 发布瞬间的字节数
+  sha256     TEXT NOT NULL,                -- 发布瞬间的流式内容摘要
+  records    INTEGER NOT NULL,             -- 该文件应有的 FASTQ 记录数
+  PRIMARY KEY (run_id, filename)
+);
 """
+
+# 老库升级:CREATE TABLE IF NOT EXISTS 不会补列,这里按需 ALTER。
+_ADDED_COLUMNS = (
+    ("runs", "integrity_mode", "TEXT"),
+    ("runs", "verified_at", "TEXT"),
+)
 
 
 @contextmanager
@@ -48,4 +64,8 @@ def db_conn(path):
 def init_db(path):
     with db_conn(path) as conn:
         conn.executescript(SCHEMA)
+        for table, column, decl in _ADDED_COLUMNS:
+            existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
         conn.execute("PRAGMA journal_mode = WAL")

@@ -5,7 +5,9 @@
 - 成功:输出目录整体 os.rename 到 published/<运行号>/,同事务写入计数,
   之后状态置为 published。任何一步失败都不会留下半套已发布文件。
 - 失败/中断:状态置 failed,暂存与可能的半成品目录被清理;同一运行号可重试。
-- 已发布:同一运行号拒绝改写。
+- 已发布:发布时登记每组 R1/R2 的字节数与 SHA-256;启动及下载前流式重算,
+  发现缺失/截断/等长内容不符即把整次运行标 failed 并移出供数区;
+  同一运行号拒绝改写。
 """
 import os
 import re
@@ -21,9 +23,10 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .config import db_path, published_dir, staging_dir
+from .config import db_path, published_dir, quarantine_dir, staging_dir
 from .db import db_conn, init_db
 from .demux import demultiplex
+from .integrity import IntegrityCheckError, hash_file, verify_published
 from .samples import load_samples
 
 RUN_NUMBER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -49,9 +52,68 @@ def _remove(path) -> None:
             pass
 
 
+def quarantine_run(run_number: str) -> None:
+    """把核验失败的已发布目录移出供数区(保留现场),移不动则删除。"""
+    src = published_dir() / run_number
+    if not src.exists() and not src.is_symlink():
+        return
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = quarantine_dir() / f"{run_number}-{stamp}-{uuid.uuid4().hex[:8]}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.rename(src, dest)
+    except OSError:
+        _remove(src)
+
+
+def fail_integrity(run_id: int, run_number: str, detail: str) -> str:
+    """把一次运行标为失败并停止供数;返回写入页面的原因。"""
+    reason = f"已发布数据完整性核验失败,已停止整次运行供数: {detail}"
+    with db_conn(db_path()) as conn:
+        conn.execute(
+            "UPDATE runs SET status='failed', error=?, integrity_mode=NULL, "
+            "verified_at=NULL, updated_at=? WHERE id=? AND status='published'",
+            (reason, utcnow(), run_id),
+        )
+    quarantine_run(run_number)
+    return reason
+
+
+def _published_snapshot():
+    """一次性取出待核验的已发布运行、分组计数和内容摘要依据。"""
+    with db_conn(db_path()) as conn:
+        runs = conn.execute(
+            "SELECT * FROM runs WHERE status='published' ORDER BY id"
+        ).fetchall()
+        snapshot = []
+        for run in runs:
+            counts = [
+                (r["sample_id"], r["pairs"])
+                for r in conn.execute(
+                    "SELECT sample_id, pairs FROM sample_counts WHERE run_id=?",
+                    (run["id"],),
+                )
+            ]
+            evidence = {
+                r["filename"]: {
+                    "size_bytes": r["size_bytes"],
+                    "sha256": r["sha256"],
+                    "records": r["records"],
+                }
+                for r in conn.execute(
+                    "SELECT filename, size_bytes, sha256, records "
+                    "FROM published_files WHERE run_id=?",
+                    (run["id"],),
+                )
+            }
+            snapshot.append((dict(run), counts, evidence))
+    return snapshot
+
+
 def recover_interrupted() -> None:
-    """启动恢复:凡未走到 published 的运行一律标失败并清掉半成品,
-    保证发布区里只存在完整运行的完整文件。"""
+    """启动恢复:凡未走到 published 的运行一律标失败并清掉半成品;
+    已发布运行逐个重新核验,任何一组文件缺失、截断或内容不符只停该次运行,
+    不影响其他已发布运行。"""
     with db_conn(db_path()) as conn:
         stale = conn.execute(
             "SELECT id, run_number, staging_dir FROM runs WHERE status = 'processing'"
@@ -75,14 +137,23 @@ def recover_interrupted() -> None:
         for child in published_dir().iterdir():
             if child.name not in published:
                 _remove(child)
-    with db_conn(db_path()) as conn:  # 已发布但文件丢失:不允许提供残缺下载
-        for num in published:
-            if not (published_dir() / num).is_dir():
+
+    for run, counts, evidence in _published_snapshot():
+        try:
+            mode = verify_published(
+                published_dir() / run["run_number"], counts,
+                run["total_pairs"], evidence, run.get("integrity_mode"),
+            )
+            with db_conn(db_path()) as conn:
                 conn.execute(
-                    "UPDATE runs SET status='failed', error=?, updated_at=? "
-                    "WHERE run_number=? AND status='published'",
-                    ("已发布文件缺失,运行标记为失败", utcnow(), num),
+                    "UPDATE runs SET integrity_mode=?, verified_at=? WHERE id=?",
+                    (mode, utcnow(), run["id"]),
                 )
+        except Exception as exc:  # 单次运行损坏不得影响其他已发布运行
+            try:
+                fail_integrity(run["id"], run["run_number"], str(exc))
+            except Exception:
+                pass
 
 
 def setup() -> None:
@@ -139,14 +210,34 @@ def process_run(run_id: int) -> None:
             str(uploads / "i1.fastq"), sample_list, str(out),
         )
         write_log(out / "demux.log", run, sample_list, stats)
+
+        # 发布前为每组 R1/R2 登记字节数、记录数和流式 SHA-256;这是重启/下载
+        # 核验的内容依据,能识别截断以及无法靠结构发现的等长内容改写。
+        evidence = {}
+        for sid in stats["order"]:
+            pairs = stats["counts"][sid][0]
+            for suffix in ("R1", "R2"):
+                filename = f"{sid}_{suffix}.fastq"
+                size_bytes, sha256 = hash_file(out / filename)
+                evidence[filename] = {
+                    "size_bytes": size_bytes,
+                    "sha256": sha256,
+                    "records": pairs,
+                }
+        log_size, log_sha = hash_file(out / "demux.log")
+        evidence["demux.log"] = {
+            "size_bytes": log_size, "sha256": log_sha, "records": 0,
+        }
+
         if final.exists():
             raise RuntimeError(f"发布目录已存在: {final}")
         os.rename(out, final)  # 同一数据卷内原子移动:先完整落盘,再发布
         with db_conn(db_path()) as conn:
             updated = conn.execute(
                 "UPDATE runs SET status='published', total_pairs=?, published_at=?, "
-                "updated_at=? WHERE id=? AND status='processing'",
-                (stats["total_pairs"], utcnow(), utcnow(), run_id),
+                "updated_at=?, integrity_mode='digest', verified_at=? "
+                "WHERE id=? AND status='processing'",
+                (stats["total_pairs"], utcnow(), utcnow(), utcnow(), run_id),
             ).rowcount
             if updated != 1:
                 raise RuntimeError("运行状态已变化,放弃发布")
@@ -157,6 +248,13 @@ def process_run(run_id: int) -> None:
                     "INSERT INTO sample_counts(run_id, sample_id, index_seq, pairs, "
                     "corrected) VALUES (?,?,?,?,?)",
                     (run_id, sid, index_of.get(sid, ""), pairs, corrected),
+                )
+            for filename, item in evidence.items():
+                conn.execute(
+                    "INSERT INTO published_files(run_id, filename, size_bytes, sha256, "
+                    "records) VALUES (?,?,?,?,?)",
+                    (run_id, filename, item["size_bytes"], item["sha256"],
+                     item["records"]),
                 )
         _remove(staging)
     except Exception as exc:  # 任何失败:标失败 + 清半成品,不发布
@@ -228,6 +326,9 @@ async def create_run(
                 raise HTTPException(409, f"运行 {run_number} 正在处理中,请稍后查看")
             if row:  # failed:允许同号重试
                 conn.execute("DELETE FROM runs WHERE id=?", (row["id"],))
+                retry_stale_dir = published_dir() / run_number
+            else:
+                retry_stale_dir = None
             cur = conn.execute(
                 "INSERT INTO runs(run_number, status, staging_dir, r1_name, r2_name, "
                 "i1_name, samples_name, created_at, updated_at) "
@@ -238,6 +339,9 @@ async def create_run(
             run_id = cur.lastrowid
     except sqlite3.IntegrityError:
         raise HTTPException(409, f"运行 {run_number} 已存在,请刷新后查看")
+
+    if retry_stale_dir is not None:
+        _remove(retry_stale_dir)  # 失败重试:清掉上次可能残留的发布目录
 
     try:
         uploads.mkdir(parents=True)
@@ -255,6 +359,7 @@ async def create_run(
                 (f"上传或样本表错误: {exc}", utcnow(), run_id),
             )
         _remove(staging)
+        _remove(published_dir() / run_number)
         raise HTTPException(400, f"上传或样本表错误: {exc}")
 
     threading.Thread(target=process_run, args=(run_id,), daemon=True).start()
@@ -278,6 +383,62 @@ def get_counts(run_id: int):
         ).fetchall()
 
 
+def get_evidence(run_id: int):
+    with db_conn(db_path()) as conn:
+        return {
+            r["filename"]: {
+                "size_bytes": r["size_bytes"],
+                "sha256": r["sha256"],
+                "records": r["records"],
+            }
+            for r in conn.execute(
+                "SELECT filename, size_bytes, sha256, records "
+                "FROM published_files WHERE run_id=?",
+                (run_id,),
+            )
+        }
+
+
+_verify_locks = [threading.Lock() for _ in range(32)]
+
+
+def _verify_lock(run_id: int) -> threading.Lock:
+    """按运行号分片的锁:同一运行只核验一次,内存不随历史运行数增长。"""
+    return _verify_locks[run_id % len(_verify_locks)]
+
+
+def verify_run_or_fail(run):
+    """供数前核验整次运行;任何一组文件有问题就停掉整次运行,抛 409。
+
+    同一运行并发下载时只让一个线程做核验,其余线程等待结果。
+    """
+    with _verify_lock(run["id"]):
+        fresh = get_run_or_404(run["id"])
+        if fresh["status"] != "published":
+            raise HTTPException(409, fresh["error"] or "运行未发布,没有完整文件可下载")
+        counts = [(c["sample_id"], c["pairs"]) for c in get_counts(fresh["id"])]
+        try:
+            mode = verify_published(
+                published_dir() / fresh["run_number"], counts,
+                fresh["total_pairs"], get_evidence(fresh["id"]),
+                fresh["integrity_mode"],
+            )
+        except IntegrityCheckError as exc:
+            reason = fail_integrity(fresh["id"], fresh["run_number"], str(exc))
+            raise HTTPException(409, reason) from exc
+        except Exception as exc:  # 核验本身出错同样停止供数,不冒险提供文件
+            reason = fail_integrity(
+                fresh["id"], fresh["run_number"], f"核验无法完成: {exc}"
+            )
+            raise HTTPException(409, reason) from exc
+        with db_conn(db_path()) as conn:
+            conn.execute(
+                "UPDATE runs SET integrity_mode=?, verified_at=? WHERE id=?",
+                (mode, utcnow(), fresh["id"]),
+            )
+        return fresh
+
+
 @app.get("/runs/{run_id}", response_class=HTMLResponse)
 def run_detail(request: Request, run_id: int):
     run = get_run_or_404(run_id)
@@ -293,19 +454,27 @@ def run_detail(request: Request, run_id: int):
         for c in get_counts(run_id)
     ]
     return templates.TemplateResponse(
-        request, "run.html", {"run": run, "groups": groups, "labels": STATUS_LABELS}
+        request, "run.html",
+        {"run": run, "groups": groups, "labels": STATUS_LABELS,
+         # 未登记摘要的已发布运行按"仅结构核验"展示,绝不冒充有内容依据。
+         "integrity_mode": (run["integrity_mode"] or "structure")
+         if run["status"] == "published" else None},
     )
 
 
 @app.get("/api/runs/{run_id}")
 def run_status(run_id: int):
     run = get_run_or_404(run_id)
-    counts = get_counts(run_id)
+    published = run["status"] == "published"
+    counts = get_counts(run_id) if published else []
     return {
         "run_number": run["run_number"],
         "status": run["status"],
         "error": run["error"],
-        "total_pairs": run["total_pairs"],
+        # 未发布(含核验失败)时不提供任何可被当作可信计数的数字。
+        "total_pairs": run["total_pairs"] if published else None,
+        "integrity_mode": run["integrity_mode"] if published else None,
+        "verified_at": run["verified_at"] if published else None,
         "counts": [
             {"sample_id": c["sample_id"], "index_seq": c["index_seq"],
              "pairs": c["pairs"], "corrected": c["corrected"]}
@@ -318,13 +487,14 @@ def run_status(run_id: int):
 def download(run_id: int, filename: str):
     run = get_run_or_404(run_id)
     if run["status"] != "published":
-        raise HTTPException(409, "运行未发布,没有完整文件可下载")
+        raise HTTPException(409, run["error"] or "运行未发布,没有完整文件可下载")
     valid = {"demux.log"}
     for c in get_counts(run_id):
         valid.add(f"{c['sample_id']}_R1.fastq")
         valid.add(f"{c['sample_id']}_R2.fastq")
     if filename not in valid:
         raise HTTPException(404, "文件不存在")
+    run = verify_run_or_fail(run)  # 核验整次运行后,才提供其中任何文件
     path = published_dir() / run["run_number"] / filename
     if not path.is_file():
         raise HTTPException(404, "文件不存在")
